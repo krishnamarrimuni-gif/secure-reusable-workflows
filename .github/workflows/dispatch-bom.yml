@@ -41,14 +41,16 @@ jobs:
           previous="${previous:-0.0.0}"
           IFS=. read -r a b c <<< "${current%%-*}"
           IFS=. read -r x y z <<< "${previous%%-*}"
-          if [[ "$a" != "$x" ]]; then type=major
-          elif [[ "$b" != "$y" ]]; then type=minor
-          elif [[ "$c" != "$z" ]]; then type=patch
-          else type=none
+          if [[ "$a" != "$x" ]]; then type="major"
+          elif [[ "$b" != "$y" ]]; then type="minor"
+          elif [[ "$c" != "$z" ]]; then type="patch"
+          else type="none"
           fi
-          echo "current=$current" >> "$GITHUB_OUTPUT"
-          echo "previous=$previous" >> "$GITHUB_OUTPUT"
-          echo "type=$type" >> "$GITHUB_OUTPUT"
+          {
+            echo "current=$current"
+            echo "previous=$previous"
+            echo "type=$type"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Notify BOM repository
         env:

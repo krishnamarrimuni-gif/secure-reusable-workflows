@@ -48,9 +48,11 @@ jobs:
             echo "Invalid semantic version: $INPUT_VERSION" >&2
             exit 1
           fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=v$version" >> "$GITHUB_OUTPUT"
-          echo "major=${version%%.*}" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$version"
+            echo "tag=v$version"
+            echo "major=${version%%.*}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create immutable tag if absent
         id: create

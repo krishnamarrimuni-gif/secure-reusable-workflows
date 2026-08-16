@@ -54,20 +54,24 @@ jobs:
             lane="$(git tag -l "v${major}.${minor}.*" --sort=-v:refname | head -1 | sed 's/^v//' || true)"
             patch=0
             if [[ -n "$lane" ]]; then IFS=. read -r major minor patch <<< "${lane%%-*}"; patch=$((patch + 1)); fi
-            bump=patch
+            bump="patch"
           else
             IFS=. read -r major minor patch <<< "${latest%%-*}"
             bump="$REQUESTED_BUMP"
             if [[ "$bump" == auto ]]; then
               previous="$(git describe --tags --abbrev=0 2>/dev/null || true)"
               range="${previous:+$previous..}HEAD"
-              messages="$(git log --format='%s%n%b' $range)"
-              if grep -Eq '(^|[[:space:]])BREAKING CHANGE:|^[a-z]+(\([^)]*\))?!:' <<< "$messages"; then
-                bump=major
-              elif grep -Eq '^feat(\([^)]*\))?:' <<< "$messages"; then
-                bump=minor
+              if [[ -n "$previous" ]]; then
+                messages="$(git log --format='%s%n%b' "$range")"
               else
-                bump=patch
+                messages="$(git log --format='%s%n%b' HEAD)"
+              fi
+              if grep -Eq '(^|[[:space:]])BREAKING CHANGE:|^[a-z]+(\([^)]*\))?!:' <<< "$messages"; then
+                bump="major"
+              elif grep -Eq '^feat(\([^)]*\))?:' <<< "$messages"; then
+                bump="minor"
+              else
+                bump="patch"
               fi
             fi
             case "$bump" in
@@ -79,9 +83,11 @@ jobs:
           fi
 
           version="${major}.${minor}.${patch}"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "major=$major" >> "$GITHUB_OUTPUT"
-          echo "bump=$bump" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$version"
+            echo "major=$major"
+            echo "bump=$bump"
+          } >> "$GITHUB_OUTPUT"
           echo "Calculated v$version ($bump)" >> "$GITHUB_STEP_SUMMARY"
 
   release:

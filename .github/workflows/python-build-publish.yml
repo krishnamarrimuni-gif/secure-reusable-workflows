@@ -102,9 +102,11 @@ jobs:
           packages="$(yq -o=json -I=0 '[.components[] | select(.type == "python" or .type == "python-docker") | .name]' "$CONFIG_FILE")"
           images="$(yq -o=json -I=0 '[.components[] | select(.type == "python-docker") | .name]' "$CONFIG_FILE")"
           configured="$(yq -r '.python-version // ""' "$CONFIG_FILE")"
-          echo "packages=$packages" >> "$GITHUB_OUTPUT"
-          echo "images=$images" >> "$GITHUB_OUTPUT"
-          echo "python-version=${configured:-$FALLBACK_PYTHON}" >> "$GITHUB_OUTPUT"
+          {
+            echo "packages=$packages"
+            echo "images=$images"
+            echo "python-version=${configured:-$FALLBACK_PYTHON}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Calculate build version
         id: version
@@ -120,8 +122,10 @@ jobs:
             version="${base}.dev${GITHUB_RUN_NUMBER}+${GITHUB_SHA:0:8}"
             version_type=none
           fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "version-type=$version_type" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$version"
+            echo "version-type=$version_type"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Input summary
         run: |

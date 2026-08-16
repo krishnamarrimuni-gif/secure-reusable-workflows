@@ -91,9 +91,11 @@ jobs:
           gradle="$(yq -o=json -I=0 '[.components[] | select(.type == "gradle" or .type == "gradle-docker") | .name]' "$CONFIG_FILE")"
           images="$(yq -o=json -I=0 '[.components[] | select(.type == "gradle-docker") | .name]' "$CONFIG_FILE")"
           configured="$(yq -r '.java-version // ""' "$CONFIG_FILE")"
-          echo "gradle=$gradle" >> "$GITHUB_OUTPUT"
-          echo "images=$images" >> "$GITHUB_OUTPUT"
-          echo "java-version=${configured:-$FALLBACK_JAVA}" >> "$GITHUB_OUTPUT"
+          {
+            echo "gradle=$gradle"
+            echo "images=$images"
+            echo "java-version=${configured:-$FALLBACK_JAVA}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Calculate build version
         id: version
@@ -108,8 +110,10 @@ jobs:
             version="${latest%%-*}.dev${GITHUB_RUN_NUMBER}+${GITHUB_SHA:0:8}"
             version_type=none
           fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "version-type=$version_type" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$version"
+            echo "version-type=$version_type"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Input summary
         run: |
