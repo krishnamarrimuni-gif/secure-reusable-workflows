@@ -1,0 +1,94 @@
+name: Semantic release
+
+on:
+  push:
+    branches:
+      - main
+      - hotfix/**
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Override version bump
+        type: choice
+        options: [auto, major, minor, patch]
+        default: auto
+  workflow_call:
+    inputs:
+      bump:
+        type: string
+        default: auto
+    outputs:
+      version:
+        value: ${{ jobs.version.outputs.version }}
+      major:
+        value: ${{ jobs.version.outputs.major }}
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      major: ${{ steps.version.outputs.major }}
+      bump: ${{ steps.version.outputs.bump }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Calculate next version
+        id: version
+        env:
+          REQUESTED_BUMP: ${{ inputs.bump || 'auto' }}
+        run: |
+          set -euo pipefail
+          branch="$GITHUB_REF_NAME"
+          latest="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1 | sed 's/^v//' || true)"
+          latest="${latest:-0.0.0}"
+
+          if [[ "$branch" =~ ^hotfix/([0-9]+)\.([0-9]+)$ ]]; then
+            major="${BASH_REMATCH[1]}"
+            minor="${BASH_REMATCH[2]}"
+            lane="$(git tag -l "v${major}.${minor}.*" --sort=-v:refname | head -1 | sed 's/^v//' || true)"
+            patch=0
+            if [[ -n "$lane" ]]; then IFS=. read -r major minor patch <<< "${lane%%-*}"; patch=$((patch + 1)); fi
+            bump=patch
+          else
+            IFS=. read -r major minor patch <<< "${latest%%-*}"
+            bump="$REQUESTED_BUMP"
+            if [[ "$bump" == auto ]]; then
+              previous="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+              range="${previous:+$previous..}HEAD"
+              messages="$(git log --format='%s%n%b' $range)"
+              if grep -Eq '(^|[[:space:]])BREAKING CHANGE:|^[a-z]+(\([^)]*\))?!:' <<< "$messages"; then
+                bump=major
+              elif grep -Eq '^feat(\([^)]*\))?:' <<< "$messages"; then
+                bump=minor
+              else
+                bump=patch
+              fi
+            fi
+            case "$bump" in
+              major) major=$((major + 1)); minor=0; patch=0 ;;
+              minor) minor=$((minor + 1)); patch=0 ;;
+              patch) patch=$((patch + 1)) ;;
+              *) echo "Unsupported bump: $bump" >&2; exit 1 ;;
+            esac
+          fi
+
+          version="${major}.${minor}.${patch}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "major=$major" >> "$GITHUB_OUTPUT"
+          echo "bump=$bump" >> "$GITHUB_OUTPUT"
+          echo "Calculated v$version ($bump)" >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    needs: version
+    uses: ./.github/workflows/create-immutable-tag.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+      version-type: ${{ needs.version.outputs.bump }}
+      make-latest: ${{ !startsWith(github.ref_name, 'hotfix/') }}
+    secrets: inherit

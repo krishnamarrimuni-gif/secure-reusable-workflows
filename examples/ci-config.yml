@@ -1,0 +1,16 @@
+python-version: "3.12"
+java-version: "21"
+components:
+  - name: api
+    type: python-docker
+    release-notes: true
+  - name: worker
+    type: python
+  - name: service
+    type: gradle-docker
+  - name: library
+    type: gradle
+release:
+  auto: false
+bom:
+  repository: example/platform-bom

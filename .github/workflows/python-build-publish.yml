@@ -1,0 +1,338 @@
+name: Reusable Python CI
+
+on:
+  workflow_call:
+    inputs:
+      config-file:
+        description: Path to the component configuration file
+        type: string
+        default: ci-config.yml
+      publish-package:
+        description: Publish Python distributions
+        type: boolean
+        default: false
+      push-image:
+        description: Push built container images
+        type: boolean
+        default: false
+      unit-tests:
+        description: Run pytest with coverage
+        type: boolean
+        default: true
+      snyk-scan:
+        description: Run Snyk dependency and code scans
+        type: boolean
+        default: true
+      image-scan:
+        description: Run a Trivy image scan
+        type: boolean
+        default: true
+      ignore-scan-errors:
+        description: Treat security gates as advisory
+        type: boolean
+        default: false
+      python-version:
+        description: Fallback Python version
+        type: string
+        default: "3.12"
+      registry:
+        description: OCI registry host
+        type: string
+        default: ghcr.io
+      package-index-url:
+        description: Optional private package upload URL
+        type: string
+        default: ""
+      artifact-retention-days:
+        type: number
+        default: 14
+    secrets:
+      registry-username:
+        required: false
+      registry-password:
+        required: false
+      package-username:
+        required: false
+      package-password:
+        required: false
+      snyk-token:
+        required: false
+    outputs:
+      version:
+        description: Version produced by the setup job
+        value: ${{ jobs.setup.outputs.version }}
+      version-type:
+        description: major, minor, patch, or none
+        value: ${{ jobs.setup.outputs.version-type }}
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+
+concurrency:
+  group: python-ci-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      package-matrix: ${{ steps.config.outputs.packages }}
+      image-matrix: ${{ steps.config.outputs.images }}
+      python-version: ${{ steps.config.outputs.python-version }}
+      version: ${{ steps.version.outputs.version }}
+      version-type: ${{ steps.version.outputs.version-type }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install yq
+        uses: mikefarah/yq@v4.44.3
+
+      - name: Resolve component matrices
+        id: config
+        env:
+          CONFIG_FILE: ${{ inputs.config-file }}
+          FALLBACK_PYTHON: ${{ inputs.python-version }}
+        run: |
+          set -euo pipefail
+          test -f "$CONFIG_FILE"
+          packages="$(yq -o=json -I=0 '[.components[] | select(.type == "python" or .type == "python-docker") | .name]' "$CONFIG_FILE")"
+          images="$(yq -o=json -I=0 '[.components[] | select(.type == "python-docker") | .name]' "$CONFIG_FILE")"
+          configured="$(yq -r '.python-version // ""' "$CONFIG_FILE")"
+          echo "packages=$packages" >> "$GITHUB_OUTPUT"
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+          echo "python-version=${configured:-$FALLBACK_PYTHON}" >> "$GITHUB_OUTPUT"
+
+      - name: Calculate build version
+        id: version
+        run: |
+          set -euo pipefail
+          latest="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1 | sed 's/^v//' || true)"
+          latest="${latest:-0.0.0}"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            version_type=none
+          else
+            base="${latest%%-*}"
+            version="${base}.dev${GITHUB_RUN_NUMBER}+${GITHUB_SHA:0:8}"
+            version_type=none
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "version-type=$version_type" >> "$GITHUB_OUTPUT"
+
+      - name: Input summary
+        run: |
+          {
+            echo "## Python CI inputs"
+            echo "| Input | Value |"
+            echo "| --- | --- |"
+            echo "| publish-package | ${{ inputs.publish-package }} |"
+            echo "| push-image | ${{ inputs.push-image }} |"
+            echo "| unit-tests | ${{ inputs.unit-tests }} |"
+            echo "| snyk-scan | ${{ inputs.snyk-scan }} |"
+            echo "| image-scan | ${{ inputs.image-scan }} |"
+            echo "| version | ${{ steps.version.outputs.version }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  packages:
+    needs: setup
+    if: ${{ needs.setup.outputs.package-matrix != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJSON(needs.setup.outputs.package-matrix) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ needs.setup.outputs.python-version }}
+          cache: pip
+          cache-dependency-path: ${{ matrix.module }}/requirements*.txt
+
+      - name: Install build and test tools
+        working-directory: ${{ matrix.module }}
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build pytest pytest-cov
+          if [[ -f requirements.txt ]]; then python -m pip install -r requirements.txt; fi
+
+      - name: Build distribution
+        working-directory: ${{ matrix.module }}
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.setup.outputs.version }}
+        run: python -m build
+
+      - name: Run tests with coverage
+        id: tests
+        if: ${{ inputs.unit-tests }}
+        working-directory: ${{ matrix.module }}
+        run: python -m pytest --cov --cov-report=xml:coverage.xml
+
+      - name: Upload coverage
+        if: ${{ always() && inputs.unit-tests }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.module }}-coverage
+          path: ${{ matrix.module }}/coverage.xml
+          if-no-files-found: warn
+          retention-days: ${{ inputs.artifact-retention-days }}
+
+      - name: Install Snyk
+        if: ${{ inputs.snyk-scan }}
+        run: npm install --global snyk
+
+      - name: Snyk dependency scan
+        id: snyk-sca
+        if: ${{ inputs.snyk-scan }}
+        working-directory: ${{ matrix.module }}
+        env:
+          SNYK_TOKEN: ${{ secrets.snyk-token }}
+        run: snyk test --file=requirements.txt --package-manager=pip --severity-threshold=high --json-file-output=snyk-sca.json
+        continue-on-error: true
+
+      - name: Snyk code scan
+        id: snyk-sast
+        if: ${{ always() && inputs.snyk-scan }}
+        working-directory: ${{ matrix.module }}
+        env:
+          SNYK_TOKEN: ${{ secrets.snyk-token }}
+        run: snyk code test --severity-threshold=high --json-file-output=snyk-sast.json
+        continue-on-error: true
+
+      - name: Upload Snyk reports
+        if: ${{ always() && inputs.snyk-scan }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.module }}-snyk-reports
+          path: ${{ matrix.module }}/snyk-*.json
+          if-no-files-found: warn
+          retention-days: ${{ inputs.artifact-retention-days }}
+
+      - name: Enforce security gate
+        if: ${{ inputs.snyk-scan && !inputs.ignore-scan-errors }}
+        env:
+          SCA_OUTCOME: ${{ steps.snyk-sca.outcome }}
+          SAST_OUTCOME: ${{ steps.snyk-sast.outcome }}
+        run: |
+          if [[ "$SCA_OUTCOME" != success || "$SAST_OUTCOME" != success ]]; then
+            echo "High-severity Snyk findings or a scanner failure blocked the build" >&2
+            exit 1
+          fi
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.module }}-distributions
+          path: ${{ matrix.module }}/dist/*
+          retention-days: ${{ inputs.artifact-retention-days }}
+
+      - name: Publish distribution
+        if: ${{ inputs.publish-package && github.event_name != 'pull_request' }}
+        working-directory: ${{ matrix.module }}
+        env:
+          TWINE_USERNAME: ${{ secrets.package-username }}
+          TWINE_PASSWORD: ${{ secrets.package-password }}
+          TWINE_REPOSITORY_URL: ${{ inputs.package-index-url }}
+        run: |
+          python -m pip install twine
+          args=()
+          if [[ -n "$TWINE_REPOSITORY_URL" ]]; then args+=(--repository-url "$TWINE_REPOSITORY_URL"); fi
+          python -m twine upload "${args[@]}" dist/*
+
+      - name: Module summary
+        if: always()
+        run: |
+          {
+            echo "## Python module: ${{ matrix.module }}"
+            echo "| Property | Value |"
+            echo "| --- | --- |"
+            echo "| Version | ${{ needs.setup.outputs.version }} |"
+            echo "| Unit tests | ${{ steps.tests.outcome || 'skipped' }} |"
+            echo "| Snyk SCA | ${{ steps.snyk-sca.outcome || 'skipped' }} |"
+            echo "| Snyk SAST | ${{ steps.snyk-sast.outcome || 'skipped' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  images:
+    needs: setup
+    if: ${{ needs.setup.outputs.image-matrix != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJSON(needs.setup.outputs.image-matrix) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to registry
+        if: ${{ inputs.push-image }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ secrets.registry-username }}
+          password: ${{ secrets.registry-password }}
+
+      - name: Normalize image name
+        id: image
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          MODULE: ${{ matrix.module }}
+          VERSION: ${{ needs.setup.outputs.version }}
+        run: echo "tag=${REGISTRY}/${GITHUB_REPOSITORY,,}/${MODULE,,}:${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.module }}
+          file: ${{ matrix.module }}/Dockerfile
+          load: true
+          push: false
+          tags: ${{ steps.image.outputs.tag }}
+          build-args: |
+            VERSION=${{ needs.setup.outputs.version }}
+            PROJECT=${{ matrix.module }}
+          cache-from: type=gha,scope=python-${{ matrix.module }}
+          cache-to: type=gha,mode=max,scope=python-${{ matrix.module }}
+
+      - name: Scan image with Trivy
+        id: trivy
+        if: ${{ inputs.image-scan }}
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.image.outputs.tag }}
+          format: sarif
+          output: trivy.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: ${{ inputs.ignore-scan-errors && '0' || '1' }}
+
+      - name: Upload Trivy SARIF
+        if: ${{ always() && inputs.image-scan }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy-${{ matrix.module }}
+
+      - name: Push image
+        if: ${{ inputs.push-image && github.event_name != 'pull_request' }}
+        run: docker push '${{ steps.image.outputs.tag }}'
+
+      - name: Image summary
+        if: always()
+        run: |
+          {
+            echo "## Python image: ${{ matrix.module }}"
+            echo "| Property | Value |"
+            echo "| --- | --- |"
+            echo "| Tag | ${{ steps.image.outputs.tag }} |"
+            echo "| Build | ${{ steps.build.outcome }} |"
+            echo "| Trivy | ${{ steps.trivy.outcome || 'skipped' }} |"
+            echo "| Push enabled | ${{ inputs.push-image }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

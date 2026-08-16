@@ -1,0 +1,79 @@
+name: Dispatch release to BOM
+
+on:
+  workflow_call:
+    inputs:
+      bom-repository:
+        description: owner/repository receiving repository_dispatch
+        required: true
+        type: string
+      event-type:
+        type: string
+        default: component-released
+    secrets:
+      bom-token:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require a semantic-version tag
+        run: |
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "This workflow must be called from a vX.Y.Z tag, not $GITHUB_REF" >&2
+            exit 1
+          fi
+
+      - name: Determine version type from tag delta
+        id: version
+        run: |
+          set -euo pipefail
+          current="${GITHUB_REF_NAME#v}"
+          previous="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | grep -v "^${GITHUB_REF_NAME}$" | head -1 | sed 's/^v//' || true)"
+          previous="${previous:-0.0.0}"
+          IFS=. read -r a b c <<< "${current%%-*}"
+          IFS=. read -r x y z <<< "${previous%%-*}"
+          if [[ "$a" != "$x" ]]; then type=major
+          elif [[ "$b" != "$y" ]]; then type=minor
+          elif [[ "$c" != "$z" ]]; then type=patch
+          else type=none
+          fi
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+          echo "type=$type" >> "$GITHUB_OUTPUT"
+
+      - name: Notify BOM repository
+        env:
+          GH_TOKEN: ${{ secrets.bom-token }}
+          BOM_REPOSITORY: ${{ inputs.bom-repository }}
+          EVENT_TYPE: ${{ inputs.event-type }}
+          VERSION: ${{ steps.version.outputs.current }}
+          VERSION_TYPE: ${{ steps.version.outputs.type }}
+        run: |
+          gh api --method POST "/repos/${BOM_REPOSITORY}/dispatches" \
+            -f event_type="$EVENT_TYPE" \
+            -f "client_payload[repository]=$GITHUB_REPOSITORY" \
+            -f "client_payload[component]=${GITHUB_REPOSITORY#*/}" \
+            -f "client_payload[ref]=$GITHUB_REF_NAME" \
+            -f "client_payload[version]=$VERSION" \
+            -f "client_payload[version_type]=$VERSION_TYPE"
+
+      - name: Dispatch summary
+        run: |
+          {
+            echo "## BOM dispatch"
+            echo "| Property | Value |"
+            echo "| --- | --- |"
+            echo "| Target | ${{ inputs.bom-repository }} |"
+            echo "| Version | ${{ steps.version.outputs.current }} |"
+            echo "| Previous | ${{ steps.version.outputs.previous }} |"
+            echo "| Change | ${{ steps.version.outputs.type }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

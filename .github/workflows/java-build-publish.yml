@@ -1,0 +1,349 @@
+name: Reusable Java CI
+
+on:
+  workflow_call:
+    inputs:
+      config-file:
+        type: string
+        default: ci-config.yml
+      publish-gradle:
+        description: Publish Gradle artifacts
+        type: boolean
+        default: false
+      push-image:
+        description: Push built container images
+        type: boolean
+        default: false
+      unit-tests:
+        type: boolean
+        default: true
+      snyk-scan:
+        type: boolean
+        default: true
+      image-scan:
+        type: boolean
+        default: true
+      ignore-scan-errors:
+        type: boolean
+        default: false
+      java-version:
+        type: string
+        default: "17"
+      java-tool-options:
+        type: string
+        default: -Dfile.encoding=UTF-8
+      registry:
+        type: string
+        default: ghcr.io
+      artifact-retention-days:
+        type: number
+        default: 14
+    secrets:
+      registry-username:
+        required: false
+      registry-password:
+        required: false
+      package-username:
+        required: false
+      package-password:
+        required: false
+      snyk-token:
+        required: false
+    outputs:
+      version:
+        value: ${{ jobs.setup.outputs.version }}
+      version-type:
+        value: ${{ jobs.setup.outputs.version-type }}
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+
+concurrency:
+  group: java-ci-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      gradle-matrix: ${{ steps.config.outputs.gradle }}
+      image-matrix: ${{ steps.config.outputs.images }}
+      java-version: ${{ steps.config.outputs.java-version }}
+      version: ${{ steps.version.outputs.version }}
+      version-type: ${{ steps.version.outputs.version-type }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: mikefarah/yq@v4.44.3
+
+      - name: Resolve component matrices
+        id: config
+        env:
+          CONFIG_FILE: ${{ inputs.config-file }}
+          FALLBACK_JAVA: ${{ inputs.java-version }}
+        run: |
+          set -euo pipefail
+          test -f "$CONFIG_FILE"
+          gradle="$(yq -o=json -I=0 '[.components[] | select(.type == "gradle" or .type == "gradle-docker") | .name]' "$CONFIG_FILE")"
+          images="$(yq -o=json -I=0 '[.components[] | select(.type == "gradle-docker") | .name]' "$CONFIG_FILE")"
+          configured="$(yq -r '.java-version // ""' "$CONFIG_FILE")"
+          echo "gradle=$gradle" >> "$GITHUB_OUTPUT"
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+          echo "java-version=${configured:-$FALLBACK_JAVA}" >> "$GITHUB_OUTPUT"
+
+      - name: Calculate build version
+        id: version
+        run: |
+          set -euo pipefail
+          latest="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1 | sed 's/^v//' || true)"
+          latest="${latest:-0.0.0}"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            version_type=none
+          else
+            version="${latest%%-*}.dev${GITHUB_RUN_NUMBER}+${GITHUB_SHA:0:8}"
+            version_type=none
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "version-type=$version_type" >> "$GITHUB_OUTPUT"
+
+      - name: Input summary
+        run: |
+          {
+            echo "## Java CI inputs"
+            echo "| Input | Value |"
+            echo "| --- | --- |"
+            echo "| publish-gradle | ${{ inputs.publish-gradle }} |"
+            echo "| push-image | ${{ inputs.push-image }} |"
+            echo "| unit-tests | ${{ inputs.unit-tests }} |"
+            echo "| snyk-scan | ${{ inputs.snyk-scan }} |"
+            echo "| image-scan | ${{ inputs.image-scan }} |"
+            echo "| Java | ${{ steps.config.outputs.java-version }} |"
+            echo "| Version | ${{ steps.version.outputs.version }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  gradle:
+    needs: setup
+    if: ${{ needs.setup.outputs.gradle-matrix != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJSON(needs.setup.outputs.gradle-matrix) }}
+    runs-on: ubuntu-latest
+    env:
+      JAVA_TOOL_OPTIONS: ${{ inputs.java-tool-options }}
+      VERSION_NUMBER: ${{ needs.setup.outputs.version }}
+      PACKAGE_USERNAME: ${{ secrets.package-username }}
+      PACKAGE_PASSWORD: ${{ secrets.package-password }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ needs.setup.outputs.java-version }}
+          cache: gradle
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build module
+        id: build
+        run: ./gradlew :${{ matrix.module }}:build -PapplicationVersion=${{ needs.setup.outputs.version }} --no-daemon --stacktrace
+
+      - name: Run unit tests
+        id: tests
+        if: ${{ inputs.unit-tests }}
+        run: ./gradlew :${{ matrix.module }}:test :${{ matrix.module }}:jacocoTestReport --no-daemon --stacktrace
+
+      - name: Upload unit and JaCoCo reports
+        if: ${{ always() && inputs.unit-tests }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.module }}-test-reports
+          path: |
+            ${{ matrix.module }}/build/reports/tests/
+            ${{ matrix.module }}/build/reports/jacoco/
+          if-no-files-found: warn
+          retention-days: ${{ inputs.artifact-retention-days }}
+
+      - name: Install Snyk
+        if: ${{ inputs.snyk-scan }}
+        run: npm install --global snyk
+
+      - name: Snyk dependency scan
+        id: snyk-sca
+        if: ${{ inputs.snyk-scan }}
+        env:
+          SNYK_TOKEN: ${{ secrets.snyk-token }}
+        run: snyk test --gradle-sub-project=${{ matrix.module }} --severity-threshold=high --json-file-output=${{ matrix.module }}-snyk-sca.json
+        continue-on-error: true
+
+      - name: Snyk code scan
+        id: snyk-sast
+        if: ${{ always() && inputs.snyk-scan }}
+        env:
+          SNYK_TOKEN: ${{ secrets.snyk-token }}
+        run: snyk code test --severity-threshold=high --json-file-output=${{ matrix.module }}-snyk-sast.json
+        continue-on-error: true
+
+      - name: Snyk monitor
+        if: ${{ always() && inputs.snyk-scan && github.event_name != 'pull_request' }}
+        env:
+          SNYK_TOKEN: ${{ secrets.snyk-token }}
+        run: snyk monitor --gradle-sub-project=${{ matrix.module }} --target-reference=${{ github.ref_name }}
+        continue-on-error: ${{ inputs.ignore-scan-errors }}
+
+      - name: Upload Snyk reports
+        if: ${{ always() && inputs.snyk-scan }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.module }}-snyk-reports
+          path: ${{ matrix.module }}-snyk-*.json
+          if-no-files-found: warn
+          retention-days: ${{ inputs.artifact-retention-days }}
+
+      - name: Enforce security gate
+        if: ${{ inputs.snyk-scan && !inputs.ignore-scan-errors }}
+        env:
+          SCA_OUTCOME: ${{ steps.snyk-sca.outcome }}
+          SAST_OUTCOME: ${{ steps.snyk-sast.outcome }}
+        run: |
+          if [[ "$SCA_OUTCOME" != success || "$SAST_OUTCOME" != success ]]; then
+            echo "High-severity Snyk findings or a scanner failure blocked the build" >&2
+            exit 1
+          fi
+
+      - name: Publish Gradle artifacts
+        if: ${{ inputs.publish-gradle && github.event_name != 'pull_request' }}
+        run: ./gradlew :${{ matrix.module }}:publish -PapplicationVersion=${{ needs.setup.outputs.version }} --no-daemon --stacktrace
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.module }}-build-artifacts
+          path: |
+            ${{ matrix.module }}/build/libs/*.jar
+            ${{ matrix.module }}/build/distributions/*
+          if-no-files-found: warn
+          retention-days: ${{ inputs.artifact-retention-days }}
+
+      - name: Module summary
+        if: always()
+        run: |
+          {
+            echo "## Gradle module: ${{ matrix.module }}"
+            echo "| Property | Value |"
+            echo "| --- | --- |"
+            echo "| Version | ${{ needs.setup.outputs.version }} |"
+            echo "| Build | ${{ steps.build.outcome }} |"
+            echo "| Unit tests | ${{ steps.tests.outcome || 'skipped' }} |"
+            echo "| Snyk SCA | ${{ steps.snyk-sca.outcome || 'skipped' }} |"
+            echo "| Snyk SAST | ${{ steps.snyk-sast.outcome || 'skipped' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  images:
+    needs: setup
+    if: ${{ needs.setup.outputs.image-matrix != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJSON(needs.setup.outputs.image-matrix) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ needs.setup.outputs.java-version }}
+          cache: gradle
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build application artifacts
+        run: ./gradlew :${{ matrix.module }}:build -x test -PapplicationVersion=${{ needs.setup.outputs.version }} --no-daemon
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to registry
+        if: ${{ inputs.push-image }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ secrets.registry-username }}
+          password: ${{ secrets.registry-password }}
+
+      - name: Normalize image name
+        id: image
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          MODULE: ${{ matrix.module }}
+          VERSION: ${{ needs.setup.outputs.version }}
+        run: echo "tag=${REGISTRY}/${GITHUB_REPOSITORY,,}/${MODULE,,}:${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        id: build-image
+        uses: docker/build-push-action@v6
+        continue-on-error: true
+        with:
+          context: ${{ matrix.module }}
+          file: ${{ matrix.module }}/Dockerfile
+          load: true
+          push: false
+          tags: ${{ steps.image.outputs.tag }}
+          build-args: |
+            VERSION=${{ needs.setup.outputs.version }}
+            PROJECT=${{ matrix.module }}
+          cache-from: type=gha,scope=java-${{ matrix.module }}
+          cache-to: type=gha,mode=max,scope=java-${{ matrix.module }}
+
+      - name: Retry image build
+        if: ${{ steps.build-image.outcome != 'success' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.module }}
+          file: ${{ matrix.module }}/Dockerfile
+          load: true
+          push: false
+          tags: ${{ steps.image.outputs.tag }}
+          build-args: VERSION=${{ needs.setup.outputs.version }}
+
+      - name: Scan image with Trivy
+        id: trivy
+        if: ${{ inputs.image-scan }}
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.image.outputs.tag }}
+          format: sarif
+          output: trivy.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: ${{ inputs.ignore-scan-errors && '0' || '1' }}
+
+      - name: Upload Trivy SARIF
+        if: ${{ always() && inputs.image-scan }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy-${{ matrix.module }}
+
+      - name: Push image
+        if: ${{ inputs.push-image && github.event_name != 'pull_request' }}
+        run: docker push '${{ steps.image.outputs.tag }}'
+
+      - name: Image summary
+        if: always()
+        run: |
+          {
+            echo "## Java image: ${{ matrix.module }}"
+            echo "| Property | Value |"
+            echo "| --- | --- |"
+            echo "| Tag | ${{ steps.image.outputs.tag }} |"
+            echo "| Build | ${{ steps.build-image.outcome }} |"
+            echo "| Trivy | ${{ steps.trivy.outcome || 'skipped' }} |"
+            echo "| Push enabled | ${{ inputs.push-image }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
